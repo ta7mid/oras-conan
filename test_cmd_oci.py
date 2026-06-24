@@ -2,47 +2,59 @@
 
 Run:  python test_cmd_oci.py
 """
+
 import importlib.util
 import os
 import re
 import sys
-
-# Load cmd_oci.py without importing conan (it only imports conan at module top,
-# so we exec just the helper functions we need by stubbing the conan imports).
-HERE = os.path.dirname(os.path.abspath(__file__))
-PATH = os.path.join(HERE, "extensions", "commands", "cmd_oci.py")
-
-# Stub the conan modules so the import at the top of cmd_oci.py succeeds.
 import types
-for name in ("conan", "conan.api", "conan.api.model", "conan.api.output",
-             "conan.cli", "conan.cli.command", "conan.errors"):
-    sys.modules.setdefault(name, types.ModuleType(name))
-sys.modules["conan.api.model"].ListPattern = object
-sys.modules["conan.api.model"].PackagesList = object
-sys.modules["conan.api.model"].MultiPackagesList = object
-sys.modules["conan.api.output"].ConanOutput = object
-sys.modules["conan.cli"].make_abs_path = lambda p: p
-sys.modules["conan.cli.command"].conan_command = lambda *a, **k: (lambda f: f)
-sys.modules["conan.cli.command"].conan_subcommand = lambda *a, **k: (lambda f: f)
-sys.modules["conan.cli.command"].OnceArgument = object
+
+
 class _CE(Exception):
     pass
-sys.modules["conan.errors"].ConanException = _CE
 
-spec = importlib.util.spec_from_file_location("cmd_oci", PATH)
-m = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(m)
+
+def _identity_decorator(*_a: object, **_k: object):
+    return lambda f: f
+
+
+# Stub the conan modules so the `import conan.*` at the top of cmd_oci.py succeeds;
+# we only exercise the pure helpers, which don't touch the real Conan/ORAS APIs.
+# (setattr, not direct attribute assignment, so static checkers don't flag the
+# dynamically-created module attributes.)
+for _name in ("conan", "conan.api", "conan.api.model", "conan.api.output",
+              "conan.cli", "conan.cli.command", "conan.errors"):
+    sys.modules.setdefault(_name, types.ModuleType(_name))
+for _mod, _attr, _value in (
+    ("conan.api.model", "ListPattern", object),
+    ("conan.api.model", "PackagesList", object),
+    ("conan.api.model", "MultiPackagesList", object),
+    ("conan.api.output", "ConanOutput", object),
+    ("conan.cli", "make_abs_path", _identity_decorator()),
+    ("conan.cli.command", "conan_command", _identity_decorator),
+    ("conan.cli.command", "conan_subcommand", _identity_decorator),
+    ("conan.cli.command", "OnceArgument", object),
+    ("conan.errors", "ConanException", _CE),
+):
+    setattr(sys.modules[_mod], _attr, _value)
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+PATH = os.path.join(HERE, "extensions", "commands", "cmd_oci.py")
+_spec = importlib.util.spec_from_file_location("cmd_oci", PATH)
+assert _spec is not None and _spec.loader is not None
+m = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(m)
 
 TAG_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$")
 
 
-def test_sanitize():
+def test_sanitize() -> None:
     assert m._sanitize("1.2.3") == "1.2.3"
     assert m._sanitize("1.0+build/2") == "1.0_build_2"
     assert m._sanitize("a:b#c") == "a_b_c"
 
 
-def test_tag_is_legal_and_deterministic():
+def test_tag_is_legal_and_deterministic() -> None:
     pid = "d62d3d2f3b1c4e5a6b7c8d9e0f1a2b3c4d5e6f7a"
     t1 = m._tag_for("1.2.3", "abcdef1234567890", pid)
     t2 = m._tag_for("1.2.3", "abcdef1234567890", pid)
@@ -59,17 +71,18 @@ def test_tag_is_legal_and_deterministic():
     assert m._tag_for("1.2.3", None, pid) == f"1.2.3-norev-{pid}"
 
 
-def test_split_target():
+def test_split_target() -> None:
     assert m._split_target("localhost:5000/conan") == ("localhost:5000", "conan")
     assert m._split_target("ghcr.io/Me/Conan/") == ("ghcr.io", "me/conan")  # lowercased
     try:
         m._split_target("ghcr.io")  # no namespace
-        assert False, "expected ConanException"
     except _CE:
         pass
+    else:
+        raise AssertionError("expected ConanException")
 
 
-def test_pkglist_entries():
+def test_pkglist_entries() -> None:
     serialized = {
         "Local Cache": {
             "hello/1.0": {"revisions": {"53321bba8793db6f": {
@@ -95,7 +108,7 @@ def test_pkglist_entries():
     assert any(t.endswith("-recipe") for t in tags)
 
 
-def test_version_matches():
+def test_version_matches() -> None:
     assert m._version_matches("*", "1.2.3")
     assert m._version_matches("", "1.2.3")
     assert m._version_matches("1.2.3", "1.2.3")
@@ -104,8 +117,8 @@ def test_version_matches():
 
 
 if __name__ == "__main__":
-    for name, fn in sorted(globals().items()):
-        if name.startswith("test_") and callable(fn):
+    for _fn_name, fn in sorted(globals().items()):
+        if _fn_name.startswith("test_") and callable(fn):
             fn()
-            print(f"ok  {name}")
+            print(f"ok  {_fn_name}")
     print("all passed")

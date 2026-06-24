@@ -9,17 +9,30 @@ manifests and integrity preserved) is serialized by Conan's own
 Requires the ORAS python client:  pip install oras==0.2.42
 """
 
+from __future__ import annotations
+
+import argparse
 import os
 import re
 import tempfile
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from typing import TYPE_CHECKING, Any
 
-from conan.api.model import ListPattern, PackagesList, MultiPackagesList
+from conan.api.model import ListPattern, MultiPackagesList, PackagesList
 from conan.api.output import ConanOutput
 from conan.cli import make_abs_path
-from conan.cli.command import conan_command, conan_subcommand, OnceArgument
+from conan.cli.command import OnceArgument, conan_command, conan_subcommand
 from conan.errors import ConanException
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
+
+    from conan.api.conan_api import ConanAPI
+    from oras.client import OrasClient
+
+# A (target, label) pair: the OCI reference to pull/push and a human label for logs.
+Target = tuple[str, str]
 
 
 # ---- pure helpers (covered by test_cmd_oci.py) ----------------------------
@@ -27,12 +40,12 @@ from conan.errors import ConanException
 _TAG_BAD = re.compile(r"[^A-Za-z0-9_.-]")
 
 
-def _sanitize(s):
+def _sanitize(s: str) -> str:
     """Make a string legal as the variable part of an OCI tag."""
     return _TAG_BAD.sub("_", s)
 
 
-def _tag_for(version, recipe_revision, package_id):
+def _tag_for(version: str, recipe_revision: str | None, package_id: str | None) -> str:
     """name is encoded in the repo path; the tag identifies a binary within it.
 
     <version>-<rrev8>-<package_id>, or <version>-<rrev8>-recipe for a recipe-only
@@ -43,13 +56,15 @@ def _tag_for(version, recipe_revision, package_id):
     return f"{_sanitize(version)}-{rrev8}-{package_id or 'recipe'}"
 
 
-def _split_target(base):
+def _split_target(base: str) -> tuple[str, str]:
     """'localhost:5000/conan' -> ('localhost:5000', 'conan'). Registry host kept,
     namespace path lowercased (OCI repositories must be lowercase)."""
     base = base.rstrip("/")
     if "/" not in base:
-        raise ConanException(f"OCI target '{base}' must be <registry>/<namespace>, "
-                             "e.g. ghcr.io/me/conan or localhost:5000/conan")
+        raise ConanException(
+            f"OCI target '{base}' must be <registry>/<namespace>, "
+            "e.g. ghcr.io/me/conan or localhost:5000/conan"
+        )
     host, _, ns = base.partition("/")
     return host, ns.lower()
 
@@ -58,51 +73,62 @@ def _split_target(base):
 # ponytail: oras-py is pre-1.0 and churns across 0.2.x — version is pinned in
 # README and every oras call lives here, so a future bump touches one place only.
 
-def _oras_client(args):
+def _oras_client(args: argparse.Namespace) -> OrasClient:
     try:
         import oras.client
     except ImportError:
-        raise ConanException("ORAS client not found - run: pip install oras==0.2.42")
+        raise ConanException("ORAS client not found - run: pip install oras==0.2.42") from None
     client = oras.client.OrasClient(insecure=args.insecure)
     if args.user and args.password:
         host = _split_target(args.target)[0]
-        client.login(username=args.user, password=args.password, hostname=host,
-                     tls_verify=not args.insecure)
+        client.login(
+            username=args.user, password=args.password, hostname=host,
+            tls_verify=not args.insecure,
+        )
     return client
 
 
-def _auth_args(subparser):
+def _auth_args(subparser: argparse.ArgumentParser) -> None:
     subparser.add_argument("target", help="OCI base, e.g. ghcr.io/me/conan")
     subparser.add_argument("--user", action=OnceArgument, help="Registry username")
     subparser.add_argument("--password", action=OnceArgument, help="Registry password/token")
-    subparser.add_argument("--insecure", action="store_true",
-                           help="Allow http / skip TLS verify (local registries)")
+    subparser.add_argument(
+        "--insecure", action="store_true",
+        help="Allow http / skip TLS verify (local registries)",
+    )
 
 
 # ---- commands -------------------------------------------------------------
 
 @conan_command(group="Custom commands")
-def oci(conan_api, parser, *args):
+def oci(conan_api: ConanAPI, parser: argparse.ArgumentParser, *argv: list[str]) -> None:
     """Push/pull Conan packages to/from an OCI registry using ORAS."""
 
 
 @conan_subcommand()
-def oci_push(conan_api, parser, subparser, *args):
+def oci_push(
+    conan_api: ConanAPI,
+    parser: argparse.ArgumentParser,
+    subparser: argparse.ArgumentParser,
+    *argv: list[str],
+) -> None:
     """Push matching packages from the local cache to an OCI registry."""
-    subparser.add_argument("reference", help="Conan reference/pattern, e.g. 'zlib/1.3.1' or 'zlib/*'")
+    subparser.add_argument(
+        "reference", help="Conan reference/pattern, e.g. 'zlib/1.3.1' or 'zlib/*'"
+    )
     _auth_args(subparser)
-    args = parser.parse_args(*args)
+    args: argparse.Namespace = parser.parse_args(argv[0] if argv else None)
     out = ConanOutput()
 
     # package_id="*" makes the pattern include binaries (mirrors `conan upload`).
-    pkg_list = conan_api.list.select(ListPattern(args.reference, package_id="*"), remote=None)
+    pkg_list = conan_api.list.select(ListPattern(args.reference, package_id="*"))
     _split_target(args.target)  # validate target shape early
     client = _oras_client(args)
 
     pushed = 0
     with tempfile.TemporaryDirectory() as tmp:
         for ref, packages in pkg_list.items():
-            entries = list(packages.items()) or [(None, None)]  # recipe-only if no binaries
+            entries = list(packages.items()) or [(None, {})]  # recipe-only if no binaries
             for pref, info in entries:
                 full = pref.repr_notime() if pref else ref.repr_notime()
                 single = PackagesList()
@@ -114,8 +140,7 @@ def oci_push(conan_api, parser, subparser, *args):
                     os.remove(tgz)
                 conan_api.cache.save(single, tgz)
 
-                tag = _tag_for(str(ref.version), ref.revision,
-                               pref.package_id if pref else None)
+                tag = _tag_for(str(ref.version), ref.revision, pref.package_id if pref else None)
                 target = f"{args.target.rstrip('/')}/{ref.name}:{tag}"
                 annotations = {
                     "conan.reference": full,
@@ -123,28 +148,40 @@ def oci_push(conan_api, parser, subparser, *args):
                     "conan.package_id": pref.package_id if pref else "",
                     "conan.package_revision": (pref.revision or "") if pref else "",
                 }
-                client.push(target=target, files=[tgz], manifest_annotations=annotations,
-                            disable_path_validation=True)  # tgz lives in a temp dir, not cwd
+                client.push(
+                    target=target, files=[tgz], manifest_annotations=annotations,
+                    disable_path_validation=True,  # tgz lives in a temp dir, not cwd
+                )
                 out.info(f"Pushed {full} -> {target}")
                 pushed += 1
     out.success(f"Pushed {pushed} artifact(s) to {args.target}")
 
 
 @conan_subcommand()
-def oci_pull(conan_api, parser, subparser, *args):
+def oci_pull(
+    conan_api: ConanAPI,
+    parser: argparse.ArgumentParser,
+    subparser: argparse.ArgumentParser,
+    *argv: list[str],
+) -> None:
     """Pull packages from an OCI registry into the local cache.
 
     Give a reference/pattern, or --list with a Conan package-list JSON
     (as produced by `conan list ... --format=json`) to pull an explicit set.
     """
-    subparser.add_argument("reference", nargs="?",
-                           help="Conan reference/pattern, e.g. 'zlib/1.3.1' or 'zlib/*'")
+    subparser.add_argument(
+        "reference", nargs="?",
+        help="Conan reference/pattern, e.g. 'zlib/1.3.1' or 'zlib/*'",
+    )
     _auth_args(subparser)
-    subparser.add_argument("--package-id", action=OnceArgument,
-                           help="Only this package_id (pattern mode only)")
-    subparser.add_argument("-l", "--list", action=OnceArgument,
-                           help="Pull the packages in this Conan package-list JSON file")
-    args = parser.parse_args(*args)
+    subparser.add_argument(
+        "--package-id", action=OnceArgument, help="Only this package_id (pattern mode only)"
+    )
+    subparser.add_argument(
+        "-l", "--list", action=OnceArgument,
+        help="Pull the packages in this Conan package-list JSON file",
+    )
+    args: argparse.Namespace = parser.parse_args(argv[0] if argv else None)
     out = ConanOutput()
 
     if bool(args.reference) == bool(args.list):
@@ -173,7 +210,9 @@ def oci_pull(conan_api, parser, subparser, *args):
 
 # ---- internals ------------------------------------------------------------
 
-def _targets_from_pattern(client, base, reference, package_id):
+def _targets_from_pattern(
+    client: OrasClient, base: str, reference: str, package_id: str | None
+) -> list[Target]:
     """List registry tags and match against a reference/pattern -> [(target, label)]."""
     name, _, rest = reference.partition("/")
     version_pat = rest.split("#")[0].split(":")[0] or "*"
@@ -181,8 +220,8 @@ def _targets_from_pattern(client, base, reference, package_id):
     try:
         tags = client.get_tags(repo)
     except Exception as e:
-        raise ConanException(f"Could not list tags for {repo}: {e}")
-    targets = []
+        raise ConanException(f"Could not list tags for {repo}: {e}") from e
+    targets: list[Target] = []
     for tag in tags:
         target = f"{repo}:{tag}"
         ann = (client.get_manifest(target) or {}).get("annotations", {})
@@ -198,10 +237,10 @@ def _targets_from_pattern(client, base, reference, package_id):
     return targets
 
 
-def _targets_from_list(base, listfile):
+def _targets_from_list(base: str, listfile: str) -> list[Target]:
     """Read a Conan package-list JSON -> [(target, label)], computing tags directly."""
     ml = MultiPackagesList.load(listfile)  # validates JSON / rejects graph files
-    targets = []
+    targets: list[Target] = []
     for name, version, rrev, pkgid in _pkglist_entries(ml.serialize()):
         tag = _tag_for(version, rrev, pkgid)
         label = f"{name}/{version}#{rrev}" + (f":{pkgid}" if pkgid else "")
@@ -209,7 +248,13 @@ def _targets_from_list(base, listfile):
     return targets
 
 
-def _pull_many(conan_api, client, targets, workers, out):
+def _pull_many(
+    conan_api: ConanAPI,
+    client: OrasClient,
+    targets: list[Target],
+    workers: int,
+    out: ConanOutput,
+) -> int:
     """Pull each (target, label) and restore into the cache. Returns count pulled.
 
     Parallel over the network pull; restore is serialized.
@@ -220,7 +265,7 @@ def _pull_many(conan_api, client, targets, workers, out):
     """
     restore_lock = threading.Lock()
     with tempfile.TemporaryDirectory() as tmp:
-        def fetch(i_target_label):
+        def fetch(i_target_label: tuple[int, Target]) -> int:
             i, (target, label) = i_target_label
             outdir = os.path.join(tmp, str(i))  # unique: every artifact is named pkg.tgz
             os.makedirs(outdir, exist_ok=True)
@@ -237,7 +282,9 @@ def _pull_many(conan_api, client, targets, workers, out):
             return sum(ex.map(fetch, enumerate(targets)))
 
 
-def _pkglist_entries(serialized):
+def _pkglist_entries(
+    serialized: dict[str, Any],
+) -> Iterator[tuple[str, str, str, str | None]]:
     """Yield (name, version, recipe_revision, package_id_or_None) from a
     MultiPackagesList.serialize() dict, flattened across all remote keys.
     Recipe-only refs yield package_id=None. Entries with an 'error' are skipped."""
@@ -255,7 +302,7 @@ def _pkglist_entries(serialized):
                     yield name, version, rrev, pkgid
 
 
-def _version_matches(pattern, version):
+def _version_matches(pattern: str, version: str) -> bool:
     """fnmatch-style match supporting Conan's '*' in the version slot."""
     import fnmatch
     return pattern in ("", "*") or fnmatch.fnmatch(version, pattern)

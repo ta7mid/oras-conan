@@ -8,7 +8,15 @@ dependencies = []
 dev = [
     "conan>=2.29.1",
     "oras==0.2.42",
+    "ruff>=0.15.19",
 ]
+
+[tool.pyright]
+venvPath = "."
+venv = ".venv"
+
+[tool.ruff]
+line-length = 100
 
 [tool.ruff.lint]
 select = [
